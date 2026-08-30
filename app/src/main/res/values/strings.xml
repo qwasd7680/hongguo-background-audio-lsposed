@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">红果后台听</string>
+    <string name="module_description">让红果免费短剧退到后台或锁屏后继续播放当前视频的声音</string>
+</resources>
