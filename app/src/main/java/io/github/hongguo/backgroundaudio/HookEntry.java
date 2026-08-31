@@ -1,12 +1,16 @@
 package io.github.hongguo.backgroundaudio;
 
 import android.app.Activity;
+import android.app.Instrumentation;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.media.MediaPlayer;
 import android.os.PowerManager;
 import android.os.SystemClock;
 
 import java.lang.reflect.Method;
+import java.lang.ref.WeakReference;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
@@ -25,9 +29,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final String TARGET_PACKAGE = "com.phoenix.read";
     private static final String TAG = "HongguoBackgroundAudio";
     private static final long SUPPRESSION_MS = 4_000L;
+    private static final long INTERNAL_NAVIGATION_MS = 2_000L;
 
+    private static final Object NAVIGATION_LOCK = new Object();
     private static volatile long suppressUntil;
     private static volatile boolean resumed = true;
+    private static long internalNavigationUntil;
+    private static WeakReference<Activity> internalNavigationSource =
+            new WeakReference<Activity>(null);
+    private static WeakReference<Activity> currentActivity =
+            new WeakReference<Activity>(null);
     private static final Set<Class<?>> hookedClasses =
             Collections.synchronizedSet(new HashSet<Class<?>>());
 
@@ -52,6 +63,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
 
         log("loading in process " + lpparam.processName);
+        installNavigationHooks();
         installLifecycleHooks();
         installPlatformPlayerHooks();
         installKnownPlayerHooks(lpparam.classLoader);
@@ -59,15 +71,69 @@ public final class HookEntry implements IXposedHookLoadPackage {
         log("hooks ready");
     }
 
+    private static void installNavigationHooks() {
+        XC_MethodHook navigationHook = new XC_MethodHook(XCallbackPriority.HIGHEST) {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                if (param.hasThrowable()) {
+                    return;
+                }
+                Activity source = param.thisObject instanceof Activity
+                        ? (Activity) param.thisObject : null;
+                Context context = source;
+                for (Object arg : param.args) {
+                    if (source == null && arg instanceof Activity) {
+                        source = (Activity) arg;
+                    }
+                    if (context == null && arg instanceof Context) {
+                        context = (Context) arg;
+                    }
+                    if (arg instanceof Intent && isInternalIntent((Intent) arg, context)) {
+                        markInternalNavigation(source, (Intent) arg);
+                        return;
+                    }
+                    if (arg instanceof Intent[]) {
+                        for (Intent intent : (Intent[]) arg) {
+                            if (isInternalIntent(intent, context)) {
+                                markInternalNavigation(source, intent);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Activity/Fragment navigation normally reaches startActivityForResult.
+        XposedBridge.hookAllMethods(Activity.class, "startActivityForResult", navigationHook);
+        // Keep a framework-level fallback for routers using Context or ActivityResult APIs.
+        XposedBridge.hookAllMethods(Instrumentation.class, "execStartActivity", navigationHook);
+        XposedBridge.hookAllMethods(Instrumentation.class, "execStartActivities", navigationHook);
+    }
+
     private static void installLifecycleHooks() {
         XposedBridge.hookAllMethods(Activity.class, "performPause", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
+                Activity activity = (Activity) param.thisObject;
+                boolean internalNavigation = consumeInternalNavigation(activity);
+                boolean finishing = activity.isFinishing();
+                boolean changingConfiguration = activity.isChangingConfigurations();
+                clearCurrentActivity(activity);
                 resumed = false;
-                // Some Android 15 ROMs do not dispatch performUserLeaving when Home is
-                // pressed. Arm first, then let the next Activity's performResume cancel
-                // the guard immediately when this was only an in-app navigation.
-                armSuppression("activity paused");
+                if (isScreenOff(activity)) {
+                    armSuppression("screen off");
+                } else if (internalNavigation || finishing || changingConfiguration) {
+                    suppressUntil = 0L;
+                    log("pause allowed: " + activity.getClass().getName()
+                            + " internal=" + internalNavigation
+                            + " finishing=" + finishing
+                            + " config=" + changingConfiguration);
+                } else {
+                    // Android 15 ROMs do not consistently dispatch performUserLeaving
+                    // for Home gestures, so every non-internal pause is background.
+                    armSuppression("activity paused without internal launch");
+                }
             }
         });
 
@@ -83,11 +149,77 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
         XposedBridge.hookAllMethods(Activity.class, "performResume", new XC_MethodHook() {
             @Override
-            protected void afterHookedMethod(MethodHookParam param) {
+            protected void beforeHookedMethod(MethodHookParam param) {
                 resumed = true;
                 suppressUntil = 0L;
+                synchronized (NAVIGATION_LOCK) {
+                    internalNavigationUntil = 0L;
+                    internalNavigationSource = new WeakReference<Activity>(null);
+                    currentActivity = new WeakReference<Activity>((Activity) param.thisObject);
+                }
             }
         });
+    }
+
+    private static boolean isInternalIntent(Intent intent, Context context) {
+        if (intent == null) {
+            return false;
+        }
+        ComponentName component = intent.getComponent();
+        if (component != null) {
+            return TARGET_PACKAGE.equals(component.getPackageName());
+        }
+        if (TARGET_PACKAGE.equals(intent.getPackage())) {
+            return true;
+        }
+        if (context != null) {
+            try {
+                ComponentName resolved = intent.resolveActivity(context.getPackageManager());
+                return resolved != null && TARGET_PACKAGE.equals(resolved.getPackageName());
+            } catch (Throwable ignored) {
+                // Resolution is best-effort; explicit intents already cover Hongguo's router.
+            }
+        }
+        return false;
+    }
+
+    private static void markInternalNavigation(Activity source, Intent intent) {
+        synchronized (NAVIGATION_LOCK) {
+            if (source == null) {
+                source = currentActivity.get();
+            }
+            internalNavigationSource = new WeakReference<Activity>(source);
+            internalNavigationUntil = SystemClock.uptimeMillis() + INTERNAL_NAVIGATION_MS;
+        }
+        ComponentName component = intent.getComponent();
+        log("internal activity launch: source="
+                + (source == null ? "unknown" : source.getClass().getName())
+                + " target=" + (component == null ? intent.getAction() : component));
+    }
+
+    private static boolean consumeInternalNavigation(Activity activity) {
+        synchronized (NAVIGATION_LOCK) {
+            if (SystemClock.uptimeMillis() >= internalNavigationUntil) {
+                internalNavigationUntil = 0L;
+                internalNavigationSource = new WeakReference<Activity>(null);
+                return false;
+            }
+            Activity source = internalNavigationSource.get();
+            if (source != null && source != activity) {
+                return false;
+            }
+            internalNavigationUntil = 0L;
+            internalNavigationSource = new WeakReference<Activity>(null);
+            return true;
+        }
+    }
+
+    private static void clearCurrentActivity(Activity activity) {
+        synchronized (NAVIGATION_LOCK) {
+            if (currentActivity.get() == activity) {
+                currentActivity = new WeakReference<Activity>(null);
+            }
+        }
     }
 
     private static void installPlatformPlayerHooks() {
